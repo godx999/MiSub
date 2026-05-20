@@ -49,7 +49,8 @@ const globalConfigLabel = computed(() => {
 const transformModeOptions = [
   { value: 'global', label: '跟随全局设置' },
   { value: 'preset', label: '选择预设方案' },
-  { value: 'custom', label: '自定义规则模板 URL' }
+  { value: 'custom', label: '自定义规则模板 URL' },
+  { value: 'custom_template', label: '自定义规则模板' }
 ];
 
 const engineOptions = [
@@ -80,11 +81,11 @@ const enforceExternalSchemeConstraints = () => {
   const enabled = isExternalEngine.value;
   if (!enabled) return;
 
-  if (props.localProfile.transformConfigMode === 'builtin') {
+  if (props.localProfile.transformConfigMode === 'builtin' || props.localProfile.transformConfigMode === 'custom_template') {
     props.localProfile.transformConfigMode = 'preset';
   }
 
-  if (String(props.localProfile.transformConfig || '').startsWith('builtin:')) {
+  if (/^(builtin|custom):/.test(String(props.localProfile.transformConfig || ''))) {
     props.localProfile.transformConfig = '';
     selectedTransformAsset.value = null;
   }
@@ -207,12 +208,17 @@ watch(
             >
               <option value="global">跟随全局方案</option>
               <option value="builtin" :disabled="isExternalEngine">内置自动分流</option>
-              <option v-for="option in transformModeOptions.slice(1)" :key="option.value" :value="option.value">
+              <option
+                v-for="option in transformModeOptions.slice(1)"
+                :key="option.value"
+                :value="option.value"
+                :disabled="option.value === 'custom_template' && isExternalEngine"
+              >
                 {{ option.label }}
               </option>
             </select>
             <p v-if="isExternalEngine" class="mt-1 text-[10px] leading-relaxed text-amber-600 dark:text-amber-400">
-              第三方后端不支持 MiSub 内置规则源与内置模板，请选择预设远程模板或自定义 URL。
+              第三方后端不支持 MiSub 内置规则源、内置模板和本地 custom: 模板，请选择预设远程模板或自定义 URL。
             </p>
             <div v-if="localProfile.transformConfigMode === 'global'" class="flex items-center gap-1.5 mt-1.5">
                <span class="w-1.5 h-1.5 rounded-full bg-purple-500"></span>
@@ -228,9 +234,12 @@ watch(
             <input
               type="text"
               v-model="localProfile.subconverter.backend"
-              placeholder="留空则使用全局默认后端"
+              placeholder="留空跟随全局；可填 api.v1.mk"
               class="block w-full px-3 py-2 bg-orange-50/20 dark:bg-orange-900/10 border border-orange-200/50 dark:border-orange-500/20 misub-radius-md sm:text-sm dark:text-white focus:ring-orange-500"
             />
+            <p class="mt-1.5 text-[10px] leading-relaxed text-gray-400">
+              只需填写域名，运行时会自动补全 https:// 和 /sub。
+            </p>
             <div v-if="!localProfile.subconverter.backend" class="flex items-center gap-1.5 mt-1.5">
                <span class="w-1.5 h-1.5 rounded-full bg-orange-500"></span>
                <span class="text-[10px] text-orange-600 dark:text-orange-400 font-bold uppercase tracking-tight">
@@ -250,9 +259,13 @@ watch(
               placeholder="选择预设方案..."
               custom-placeholder="输入远程 .ini 规则配置 URL"
               :force-custom="localProfile.transformConfigMode === 'custom'"
+              :custom-templates-only="localProfile.transformConfigMode === 'custom_template'"
               :allowEmpty="false"
               :exclude-builtin-assets="isExternalEngine"
             />
+            <p v-if="localProfile.transformConfigMode === 'custom_template'" class="mt-2 rounded-lg bg-emerald-50 px-3 py-2 text-[10px] leading-relaxed text-emerald-700 dark:bg-emerald-900/20 dark:text-emerald-300">
+              使用设置页保存的本地自定义规则模板，选择 custom: 开头的模板项即可。
+            </p>
           </div>
         </div>
       </div>

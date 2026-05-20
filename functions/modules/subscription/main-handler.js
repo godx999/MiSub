@@ -2,14 +2,14 @@ import { StorageFactory } from '../../storage-adapter.js';
 import { migrateConfigSettings, formatBytes, migrateProfileIds, base64EncodeUtf8 } from '../utils.js';
 import { generateCombinedNodeList } from '../../services/subscription-service.js';
 import { sendEnhancedTgNotification, tgEscape } from '../notifications.js';
-import { KV_KEY_SUBS, KV_KEY_PROFILES, KV_KEY_SETTINGS, DEFAULT_SETTINGS as defaultSettings } from '../config.js';
+import { KV_KEY_SUBS, KV_KEY_PROFILES, KV_KEY_SETTINGS, DEFAULT_SETTINGS as defaultSettings, DEFAULT_SUBCONVERTER_BACKEND } from '../config.js';
 import { createDisguiseResponse } from '../disguise-page.js';
 import { generateCacheKey, setCache } from '../../services/node-cache-service.js';
 import { resolveRequestContext } from './request-context.js';
 import { resolveNodeListWithCache } from './cache-manager.js';
 import { ProcessorService } from '../../services/processor-service.js';
 import { logAccessSuccess, shouldSkipLogging as shouldSkipAccessLog } from './access-logger.js';
-import { isBrowserAgent, determineTargetFormat, isMetaCore } from './user-agent-utils.js'; // [Added] Import centralized util
+import { isBrowserAgent, determineTargetFormat, isMetaCore, isHiddifyAgent } from './user-agent-utils.js'; // [Added] Import centralized util
 import { authMiddleware } from '../auth-middleware.js';
 import { transformBuiltinSubscription } from './transformer-factory.js';
 import { fetchTransformTemplate } from './transform-template-cache.js';
@@ -19,6 +19,13 @@ import { groupNodeLinesByProtocol } from './protocol-groups.js';
 import { shouldApplyExternalTemplateForTarget } from './template-compatibility.js';
 import { renderClashFromIniTemplate, renderLoonFromIniTemplate, renderQuanxFromIniTemplate, renderSingboxFromIniTemplate, renderSurgeFromIniTemplate } from './template-pipeline.js';
 import { getBuiltinTemplate } from './builtin-template-registry.js';
+
+function maskSensitiveLogValue(value) {
+    const text = String(value ?? '');
+    if (!text) return '';
+    if (text.length <= 8) return '***';
+    return `${text.slice(0, 4)}…${text.slice(-4)} (${text.length})`;
+}
 
 const PROFILE_DOWNLOAD_COUNT_PREFIX = 'misub_profile_download_count_';
 
@@ -87,6 +94,40 @@ export function buildManagedConfigUrl(requestUrl) {
     return managedUrl.toString();
 }
 
+function getCurrentRequestUserInfo(context, sub) {
+    const currentInfo = context?.currentSubscriptionRuntimeInfo || {};
+    const runtimeKey = [sub?.id, sub?.url].find(key => key && Object.prototype.hasOwnProperty.call(currentInfo, key));
+    if (runtimeKey) {
+        return currentInfo[runtimeKey]?.userInfo || null;
+    }
+    return sub?.userInfo || null;
+}
+
+function buildUserInfoHeaderFromSubscriptions(context, subscriptions) {
+    const totalUserInfo = subscriptions.reduce((acc, sub) => {
+        const userInfo = sub?.enabled ? getCurrentRequestUserInfo(context, sub) : null;
+        if (!userInfo) return acc;
+
+        return {
+            upload: (acc.upload || 0) + (userInfo.upload || 0),
+            download: (acc.download || 0) + (userInfo.download || 0),
+            total: (acc.total || 0) + (userInfo.total || 0),
+            expire: Math.max(acc.expire || 0, userInfo.expire || 0)
+        };
+    }, { upload: 0, download: 0, total: 0, expire: 0 });
+
+    const safeUserInfo = {
+        upload: isFinite(totalUserInfo.upload) ? totalUserInfo.upload : 0,
+        download: isFinite(totalUserInfo.download) ? totalUserInfo.download : 0,
+        total: isFinite(totalUserInfo.total) ? totalUserInfo.total : 0,
+        expire: isFinite(totalUserInfo.expire) ? totalUserInfo.expire : 0
+    };
+
+    return safeUserInfo.total > 0
+        ? `upload=${safeUserInfo.upload}; download=${safeUserInfo.download}; total=${safeUserInfo.total}; expire=${safeUserInfo.expire}`
+        : null;
+}
+
 export function resolveTemplateUrl(mode, value, fallbackUrl = '') {
     const normalizedMode = typeof mode === 'string' ? mode.trim().toLowerCase() : '';
     const normalizedValue = typeof value === 'string' ? value.trim() : '';
@@ -94,6 +135,9 @@ export function resolveTemplateUrl(mode, value, fallbackUrl = '') {
 
     if (normalizedMode === 'builtin') return '';
     if (normalizedMode === 'global') return normalizedFallback;
+    if (normalizedMode === 'custom_template') {
+        return normalizedValue.startsWith('custom:') ? normalizedValue : '';
+    }
     if (normalizedMode === 'preset' || normalizedMode === 'custom') return normalizedValue;
 
     return normalizedValue;
@@ -105,12 +149,161 @@ export function resolveTemplateSource(value) {
     if (normalizedValue.startsWith('builtin:')) {
         return { kind: 'builtin', value: normalizedValue.slice('builtin:'.length) };
     }
+    if (normalizedValue.startsWith('custom:')) {
+        return { kind: 'custom', value: normalizedValue.slice('custom:'.length) };
+    }
     return { kind: 'remote', value: normalizedValue };
 }
 
 export function resolveExternalTemplateConfigUrl(templateSource) {
     if (!templateSource || typeof templateSource !== 'object') return '';
     return templateSource.kind === 'remote' ? String(templateSource.value || '').trim() : '';
+}
+
+export function normalizeSubconverterBackend(input, fallback = DEFAULT_SUBCONVERTER_BACKEND) {
+    let backend = String(input || fallback || DEFAULT_SUBCONVERTER_BACKEND).trim();
+
+    // 防止历史 UI 文案或标签被误保存为后端地址。
+    if (!backend || backend.includes('后端') || backend.includes('参数')) {
+        backend = fallback || DEFAULT_SUBCONVERTER_BACKEND;
+    }
+
+    // 用户只需填写 host，例如 subapi.cmliussss.net 或 api.v1.mk。
+    // 兼容历史完整 URL，但统一规范为 https://<host>/sub。
+    backend = backend.replace(/\s+/g, '');
+    if (!/^https?:\/\//i.test(backend)) {
+        backend = `https://${backend}`;
+    }
+
+    const externalUrl = new URL(backend);
+    if (externalUrl.pathname === '/' || !externalUrl.pathname) {
+        externalUrl.pathname = '/sub';
+    }
+    if (externalUrl.pathname !== '/sub') {
+        externalUrl.pathname = '/sub';
+    }
+
+    // 历史默认值可能保存为 /sub?；URL 会自动消除空 query。
+    externalUrl.hash = '';
+    return externalUrl;
+}
+
+export function buildExternalSubconverterUrl({
+    backend,
+    targetFormat,
+    nodeList,
+    requestUrl,
+    profileSub = {},
+    globalSub = {},
+    userAgent = '',
+    searchParams,
+    templateSource,
+    subName = ''
+} = {}) {
+    const externalUrl = normalizeSubconverterBackend(backend);
+    const params = searchParams || new URLSearchParams('');
+
+    // [优化] 解析 targetFormat，支持带参数的格式（如 surge&ver=4）
+    const [targetBase, ...targetParams] = String(targetFormat || '').split('&');
+    externalUrl.searchParams.set('target', targetBase || 'clash');
+    targetParams.forEach(p => {
+        const [k, v] = p.split('=');
+        if (k && v) externalUrl.searchParams.set(k, v);
+    });
+
+    const normalizedNodeList = String(nodeList || '').trim();
+    if (normalizedNodeList) {
+        // 关键：第三方转换模式应接收 MiSub 已完成预处理后的节点列表。
+        // subconverter 对多个内联节点更稳定的分隔符是 `|`；保留换行会让部分后端只解析首行或直接报 No nodes were found。
+        const inlineNodeList = normalizedNodeList.split(/\r?\n+/).map(line => line.trim()).filter(Boolean).join('|');
+        externalUrl.searchParams.set('url', inlineNodeList);
+    } else if (requestUrl) {
+        // 兜底保留旧回调 URL 逻辑，避免异常空列表场景构造无效 converter 请求。
+        const dataSourceUrl = new URL(requestUrl);
+        const paramsToClear = ['target', 'engine', 'builtin', 'clash', 'singbox', 'surge', 'loon', 'quanx', 'egern', 'base64', 'v2ray', 'trojan', 'list', 'include', 'exclude'];
+        paramsToClear.forEach(p => dataSourceUrl.searchParams.delete(p));
+        dataSourceUrl.searchParams.set('target', 'nodes');
+        dataSourceUrl.searchParams.set('builtin', 'true');
+        externalUrl.searchParams.set('url', dataSourceUrl.toString());
+    }
+
+    const effectiveOptions = { ...(globalSub.defaultOptions || {}), ...(profileSub.options || {}) };
+    const flagMap = { udp: 'udp', emoji: 'emoji', scv: 'scv', sort: 'sort', tfo: 'tfo', list: 'list' };
+
+    if (isMetaCore(userAgent, params)) {
+        externalUrl.searchParams.set('meta', 'true');
+    }
+
+    Object.entries(flagMap).forEach(([key, paramName]) => {
+        const val = params.has(paramName)
+            ? params.get(paramName) === 'true'
+            : effectiveOptions[key];
+        externalUrl.searchParams.set(paramName, val ? 'true' : 'false');
+    });
+
+    const externalTemplateConfigUrl = resolveExternalTemplateConfigUrl(templateSource);
+    if (externalTemplateConfigUrl) {
+        externalUrl.searchParams.set('config', externalTemplateConfigUrl);
+    }
+
+    externalUrl.searchParams.set('filename', subName);
+    return externalUrl;
+}
+
+export function resolveBuiltinEngineFlags(config = {}, isExternalMode = false) {
+    if (isExternalMode) {
+        return {
+            shouldSkipCertificateVerify: false,
+            shouldEnableUdp: false
+        };
+    }
+
+    return {
+        shouldSkipCertificateVerify: Boolean(config.builtinSkipCertVerify),
+        shouldEnableUdp: Boolean(config.builtinEnableUdp)
+    };
+}
+
+export function resolveEffectiveEngine({
+    searchParams,
+    userAgent = '',
+    profileEngineMode = '',
+    globalEngineMode = ''
+} = {}) {
+    const params = searchParams || new URLSearchParams('');
+    const builtinParam = (params.get('builtin') || '').toLowerCase();
+    const engineParam = (params.get('engine') || '').toLowerCase();
+    const hasExplicitFormat = Boolean(
+        params.get('target') ||
+        params.has('clash') ||
+        params.has('singbox') ||
+        params.has('surge') ||
+        params.has('loon') ||
+        params.has('quanx') ||
+        params.has('egern') ||
+        params.has('base64') ||
+        params.has('v2ray') ||
+        params.has('trojan') ||
+        params.has('nodes')
+    );
+
+    if (engineParam) return engineParam;
+    if (builtinParam === 'external') return 'external';
+    if (builtinParam === 'true' || builtinParam === '1' || builtinParam === 'builtin') return 'builtin';
+
+    if (!hasExplicitFormat && isHiddifyAgent(userAgent)) {
+        return 'builtin';
+    }
+
+    return profileEngineMode || globalEngineMode || 'builtin';
+}
+
+export function resolveBuiltinRequestOptions({ searchParams, userAgent = '' } = {}) {
+    return {
+        userAgent,
+        searchParams: searchParams || new URLSearchParams(''),
+        hiddifyCompatible: isHiddifyAgent(userAgent)
+    };
 }
 
 /**
@@ -123,10 +316,11 @@ export async function handleMisubRequest(context) {
     const url = new URL(request.url);
     const userAgentHeader = request.headers.get('User-Agent') || "Unknown";
 
-    console.log(`\n[MiSub Request] ${request.method} ${url.pathname}${url.search}`);
+    console.log(`\n[MiSub Request] ${request.method} ${maskSensitiveLogValue(url.pathname)}${url.search ? ' ?…' : ''}`);
     console.log(`[MiSub UA] ${userAgentHeader}`);
 
     const storageAdapter = StorageFactory.createAdapter(env, await StorageFactory.getStorageType(env));
+    context.storage = storageAdapter;
     const [settingsData, allMisubs, allProfiles] = await Promise.all([
         storageAdapter.get(KV_KEY_SETTINGS),
         storageAdapter.getAllSubscriptions(),
@@ -170,7 +364,7 @@ export async function handleMisubRequest(context) {
     context.url = url; // [核心修复] 将 url 挂载到 context，确保后续服务能获取到 debug 参数
     const { token, profileIdentifier } = resolveRequestContext(url, config, allProfiles);
 
-    console.log(`[MiSub Parse] Token: ${token}, Profile: ${profileIdentifier}`);
+    console.log(`[MiSub Parse] Token: ${maskSensitiveLogValue(token)}, Profile: ${maskSensitiveLogValue(profileIdentifier)}`);
     const shouldSkipLogging = shouldSkipAccessLog(userAgentHeader);
 
     let targetMisubs;
@@ -269,9 +463,6 @@ export async function handleMisubRequest(context) {
         targetMisubs = allMisubs.filter(s => s.enabled);
     }
 
-    const shouldSkipCertificateVerify = Boolean(config.builtinSkipCertVerify);
-    const shouldEnableUdp = Boolean(config.builtinEnableUdp);
-
     // 使用统一的确定目标格式的方法（此方法中包含了处理各类客户端如 Surge 等对应版本的最新支持规则）
     let targetFormat = determineTargetFormat(userAgentHeader, url.searchParams);
 
@@ -308,14 +499,16 @@ export async function handleMisubRequest(context) {
     const profileSub = currentProfile?.subconverter || {};
     const globalSub = config.subconverter || {};
     
-    const builtinParam = (url.searchParams.get('builtin') || '').toLowerCase();
-    const engineParam = (url.searchParams.get('engine') || '').toLowerCase();
     // [Optimization] Respect user defined engine mode while preventing loops for non-browser agents (backend fetchers)
-    const defaultEngineMode = profileSub.engineMode || globalSub.engineMode || 'builtin';
-    
-    const effectiveEngine = engineParam || (builtinParam === 'external' ? 'external' : (builtinParam === 'true' ? 'builtin' : '')) || defaultEngineMode;
+    const effectiveEngine = resolveEffectiveEngine({
+        searchParams: url.searchParams,
+        userAgent: userAgentHeader,
+        profileEngineMode: profileSub.engineMode,
+        globalEngineMode: globalSub.engineMode
+    });
     const isExternalMode = effectiveEngine === 'external';
     const useBuiltin = !isExternalMode;
+    const { shouldSkipCertificateVerify, shouldEnableUdp } = resolveBuiltinEngineFlags(config, isExternalMode);
 
     
     const globalTemplateUrl = resolveTemplateUrl(config.transformConfigMode, config.transformConfig, '');
@@ -330,7 +523,7 @@ export async function handleMisubRequest(context) {
     const resolvedGlobalLevel = config.ruleLevel || config.clashRuleLevel || 'std';
     
     let ruleLevel;
-    if (templateSource.kind === 'remote') {
+    if (templateSource.kind === 'remote' || templateSource.kind === 'custom') {
         ruleLevel = 'none';
     } else {
         ruleLevel = url.searchParams.get('level') || url.searchParams.get('ruleLevel') || resolvedProfileLevel || resolvedGlobalLevel;
@@ -412,7 +605,9 @@ export async function handleMisubRequest(context) {
             name: subName,
             operators: Array.isArray(activeProfile?.operators) ? [...activeProfile.operators] : [],
             exclude: urlExclude || activeProfile?.exclude,
-            include: urlInclude || activeProfile?.include
+            include: urlInclude || activeProfile?.include,
+            // [Issue #345] 透传 emoji 开关到内置生成器
+            addFlagEmoji: effectiveNodeTransform.addFlagEmoji
         };
 
         // [Subconverter API] 动态注入更名算子 (rename=old@new|A@B)
@@ -483,92 +678,38 @@ export async function handleMisubRequest(context) {
     // 1. If 'nodes' format requested, return plain text nodes (DataSource for external converters)
     if (targetFormat === 'nodes') {
         const contentToReturn = isProfileExpired ? (DEFAULT_EXPIRED_NODE + '\n') : combinedNodeList;
+        const userInfoHeader = buildUserInfoHeaderFromSubscriptions(context, targetMisubs);
+        const nodeHeaders = {
+            "Content-Type": "text/plain; charset=utf-8",
+            'Cache-Control': 'no-store, no-cache',
+            'X-MiSub-Mode': 'node-export-plain'
+        };
+        if (userInfoHeader) {
+            nodeHeaders['Subscription-Userinfo'] = userInfoHeader;
+            nodeHeaders['Profile-Update-Interval'] = String(config.UpdateInterval || 24);
+        }
         // [兼容性优化] 第三方转换后端对明文列表的支持通常比 Base64 更好。
         // 同时对于 Cloudflare 而言，明文输出更有利于其边缘节点的流式处理。
         return new Response(contentToReturn, { 
-            headers: { 
-                "Content-Type": "text/plain; charset=utf-8", 
-                'Cache-Control': 'no-store, no-cache',
-                'X-MiSub-Mode': 'node-export-plain'
-            } 
+            headers: nodeHeaders
         });
     }
 
     // 2. If external mode active, build the redirect URL and return 302
     if (isExternalMode && targetFormat !== 'base64') {
-        let backend = url.searchParams.get('backend') || profileSub.backend || globalSub.defaultBackend || "https://sub.id9.cc/sub?";
-        
-        // [加固] 防止 UI 标签泄漏到配置中
-        if (typeof backend === 'string' && (backend.includes('后端') || backend.includes('参数'))) {
-            backend = "https://subapi.cmliussss.net/sub?";
-        }
-
-        // [自动纠错] 如果地址不带 http/https 协议，自动补全
-        if (backend && typeof backend === 'string' && !backend.startsWith('http://') && !backend.startsWith('https://')) {
-            backend = 'http://' + backend;
-        }
-
-        const externalUrl = new URL(backend);
-
-        // [Fix] Automatically append '/sub' if the backend URL only has a root path.
-        // Most subconverter backends (FatSheep, subapi, etc.) use /sub as the conversion endpoint.
-        if (externalUrl.pathname === '/' || !externalUrl.pathname) {
-            externalUrl.pathname = '/sub';
-        }
-        // [优化] 解析 targetFormat，支持带参数的格式（如 surge&ver=4）
-        const [targetBase, ...targetParams] = targetFormat.split('&');
-        externalUrl.searchParams.set('target', targetBase);
-        targetParams.forEach(p => {
-            const [k, v] = p.split('=');
-            if (k && v) externalUrl.searchParams.set(k, v);
+        const backend = url.searchParams.get('backend') || profileSub.backend || globalSub.defaultBackend;
+        const externalUrl = buildExternalSubconverterUrl({
+            backend,
+            targetFormat,
+            nodeList: isProfileExpired ? (DEFAULT_EXPIRED_NODE + '\n') : combinedNodeList,
+            requestUrl: request.url,
+            profileSub,
+            globalSub,
+            userAgent: userAgentHeader,
+            searchParams: url.searchParams,
+            templateSource,
+            subName
         });
-        
-        // Data source is THIS worker, but forcing builtin and nodes format
-        const dataSourceUrl = new URL(request.url);
-        
-        // [加固] 彻底清理 URL 参数，防止参数污染导致后端返回 400 错误
-        // [优化] 不再强制注入 target=nodes，因为非浏览器请求已默认使用内置引擎
-        // [关键] 显式注入 builtin=true 确保后端拉取数据时强制走内置逻辑，打破重定向环
-        const paramsToClear = ['target', 'engine', 'builtin', 'clash', 'singbox', 'surge', 'loon', 'quanx', 'egern', 'base64', 'v2ray', 'trojan', 'list', 'include', 'exclude'];
-        paramsToClear.forEach(p => dataSourceUrl.searchParams.delete(p));
-        dataSourceUrl.searchParams.set('builtin', 'true');
-
-        // [关键修复] 确保后端拉取数据时包含身份令牌
-        // 只有当 URL 路径中不包含令牌时，才在查询参数中显式注入
-        const pathSegments = dataSourceUrl.pathname.split('/').filter(Boolean);
-        const hasTokenInPath = pathSegments.some(seg => seg === config.mytoken || seg === config.profileToken);
-
-        if (!hasTokenInPath && !dataSourceUrl.searchParams.has('token')) {
-            const authToken = token || currentProfile?.token || config.mytoken;
-            if (authToken) dataSourceUrl.searchParams.set('token', authToken);
-        }
-
-        externalUrl.searchParams.set('url', dataSourceUrl.toString());
-        
-        // Map Boolean Flags
-        const effectiveOptions = { ...globalSub.defaultOptions, ...profileSub.options };
-        const flagMap = { udp: 'udp', emoji: 'emoji', scv: 'scv', sort: 'sort', tfo: 'tfo', list: 'list' };
-        
-        // [元数据核心支持] 如果是 Meta 核心，告知第三方转换后端使用 Meta 语法
-        if (isMetaCore(userAgentHeader, url.searchParams)) {
-            externalUrl.searchParams.set('meta', 'true');
-        }
-
-        Object.entries(flagMap).forEach(([key, paramName]) => {
-            const val = url.searchParams.has(paramName) 
-                ? url.searchParams.get(paramName) === 'true' 
-                : effectiveOptions[key];
-            externalUrl.searchParams.set(paramName, val ? 'true' : 'false');
-        });
-
-        // Pass Remote Config if applicable
-        const externalTemplateConfigUrl = resolveExternalTemplateConfigUrl(templateSource);
-        if (externalTemplateConfigUrl) {
-            externalUrl.searchParams.set('config', externalTemplateConfigUrl);
-        }
-
-        // Add File Name
-        externalUrl.searchParams.set('filename', subName);
 
         // [Access Log] Send notification for external redirection
         if (!url.searchParams.has('callback_token') && !shouldSkipLogging && config.enableAccessLog) {
@@ -652,6 +793,7 @@ export async function handleMisubRequest(context) {
     const finalEnableTfo = urlTfo === 'true' || urlTfo === '1';
 
     const builtinOptions = {
+        ...resolveBuiltinRequestOptions({ searchParams: url.searchParams, userAgent: userAgentHeader }),
         fileName: subName,
         managedConfigUrl: '',
         interval: config.UpdateInterval || 86400,
@@ -676,28 +818,7 @@ export async function handleMisubRequest(context) {
 
     if (shouldUseBuiltin) {
         try {
-            const totalUserInfo = targetMisubs.reduce((acc, sub) => {
-                if (sub.enabled && sub.userInfo) {
-                    return {
-                        upload: (acc.upload || 0) + (sub.userInfo.upload || 0),
-                        download: (acc.download || 0) + (sub.userInfo.download || 0),
-                        total: (acc.total || 0) + (sub.userInfo.total || 0),
-                        expire: Math.max(acc.expire || 0, sub.userInfo.expire || 0)
-                    };
-                }
-                return acc;
-            }, { upload: 0, download: 0, total: 0, expire: 0 });
-
-            const safeUserInfo = {
-                upload: isFinite(totalUserInfo.upload) ? totalUserInfo.upload : 0,
-                download: isFinite(totalUserInfo.download) ? totalUserInfo.download : 0,
-                total: isFinite(totalUserInfo.total) ? totalUserInfo.total : 0,
-                expire: isFinite(totalUserInfo.expire) ? totalUserInfo.expire : 0
-            };
-
-            const userInfoHeader = safeUserInfo.total > 0 
-                ? `upload=${safeUserInfo.upload}; download=${safeUserInfo.download}; total=${safeUserInfo.total}; expire=${safeUserInfo.expire}`
-                : null;
+            const userInfoHeader = buildUserInfoHeaderFromSubscriptions(context, targetMisubs);
 
             let { content: finalContent, contentType, headers: resultHeaders } = await ProcessorService.renderOutput({
                 targetFormat,
@@ -731,8 +852,7 @@ export async function handleMisubRequest(context) {
                 "Content-Disposition": `attachment; filename="${asciiSubName}"; filename*=utf-8''${encodedSubName}`,
                 'Content-Type': contentType || 'text/plain; charset=utf-8',
                 'Cache-Control': 'no-store, no-cache',
-                'X-MiSub-Mode': `builtin-${targetFormat}`,
-                'Access-Control-Allow-Origin': '*'
+                'X-MiSub-Mode': `builtin-${targetFormat}`
             });
 
             if (userInfoHeader) {
@@ -780,6 +900,11 @@ export async function handleMisubRequest(context) {
     }
 
     const base64Headers = { "Content-Type": "text/plain; charset=utf-8", 'Cache-Control': 'no-store, no-cache' };
+    const userInfoHeader = buildUserInfoHeaderFromSubscriptions(context, targetMisubs);
+    if (userInfoHeader) {
+        base64Headers['Subscription-Userinfo'] = userInfoHeader;
+        base64Headers['Profile-Update-Interval'] = String(config.UpdateInterval || 24);
+    }
     Object.entries(cacheHeaders).forEach(([key, value]) => {
         base64Headers[key] = value;
     });

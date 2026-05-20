@@ -77,10 +77,9 @@ function buildQxLine(proxy) {
             extraParts.push(`obfs=${proxy.obfs || opts.mode}`);
             if (proxy['obfs-host'] || opts.host) extraParts.push(`obfs-host=${proxy['obfs-host'] || opts.host}`);
         } else if (plugin === 'v2ray-plugin' || opts.mode === 'websocket') {
-            extraParts.push('obfs=ws');
+            extraParts.push((opts.tls || opts.mode === 'websocket-tls') ? 'obfs=wss' : 'obfs=ws');
             if (opts.path) extraParts.push(`obfs-uri=${opts.path}`);
             if (opts.host) extraParts.push(`obfs-host=${opts.host}`);
-            if (opts.tls || opts.mode === 'websocket-tls') extraParts.push('over-tls=true');
         }
 
         if (proxy.udp) extraParts.push('udp-relay=true');
@@ -191,7 +190,8 @@ function buildQxLine(proxy) {
         if (proxy.uuid) parts.push(proxy.uuid || '');
         if (proxy.password) parts.push(proxy.password || '');
         if (proxy.sni || proxy.servername) parts.push(`sni=${proxy.sni || proxy.servername}`);
-        if (proxy['congestion-control']) parts.push(`congestion-controller=${proxy['congestion-control']}`);
+        const congestionControl = proxy['congestion-control'] || proxy['congestion-controller'];
+        if (congestionControl) parts.push(`congestion-controller=${congestionControl}`);
         if (proxy['udp-relay-mode']) parts.push(`udp-relay=${proxy['udp-relay-mode']}`);
         if (proxy.alpn) {
             const alpn = Array.isArray(proxy.alpn) ? proxy.alpn.join(',') : proxy.alpn;
@@ -253,7 +253,7 @@ export function generateBuiltinQuanxConfig(nodeList, options = {}) {
     }
 
     if (proxyLines.length === 0) {
-        return '#!MANAGED-CONFIG http://example.com interval=86400 strict=false\n[general]\nserver_check_url = http://www.gstatic.com/generate_204\nexcluded_routes = 192.168.0.0/16, 172.16.0.0/12, 100.64.0.0/10, 10.0.0.0/8\n\n[dns]\nno-ipv6\nserver = 223.5.5.5\nserver = 119.29.29.29\n\n[server_remote]\n\n[server_local]\n\n[rewrite_remote]\n\n[rewrite_local]\n\n[mitm]\n';
+        return '#!MANAGED-CONFIG http://example.com interval=86400 strict=false\n\n[general]\nserver_check_url = http://www.gstatic.com/generate_204\nexcluded_routes = 192.168.0.0/16, 172.16.0.0/12, 100.64.0.0/10, 10.0.0.0/8\n\n[dns]\nno-ipv6\nserver = 223.5.5.5\nserver = 119.29.29.29\n\n[server_remote]\n\n[server_local]\n\n[rewrite_remote]\n\n[rewrite_local]\n\n[mitm]\n';
     }
 
     const sections = [];

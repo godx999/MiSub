@@ -31,10 +31,9 @@ function buildProxyLine(proxy) {
             extras.push(`obfs=${proxy.obfs || opts.mode}`);
             if (proxy['obfs-host'] || opts.host) extras.push(`obfs-host=${proxy['obfs-host'] || opts.host}`);
         } else if (plugin === 'v2ray-plugin' || opts.mode === 'websocket') {
-            extras.push('obfs=ws');
+            extras.push((opts.tls || opts.mode === 'websocket-tls') ? 'obfs=wss' : 'obfs=ws');
             if (opts.path) extras.push(`obfs-uri=${opts.path}`);
             if (opts.host) extras.push(`obfs-host=${opts.host}`);
-            if (opts.tls || opts.mode === 'websocket-tls') extras.push('over-tls=true');
         }
         if (proxy.udp) extras.push('udp-relay=true');
         return `shadowsocks=${server}:${port}, method=${proxy.cipher || 'aes-128-gcm'}, password=${proxy.password || ''}${extras.length ? `, ${extras.join(', ')}` : ''}, tag=${name}`;
@@ -89,7 +88,8 @@ function buildProxyLine(proxy) {
         if (proxy.password) extras.push(proxy.password || '');
         const sni = proxy.servername ?? proxy.sni;
         if (sni !== undefined) extras.push(`sni=${sni}`);
-        if (proxy['congestion-control']) extras.push(`congestion-controller=${proxy['congestion-control']}`);
+        const congestionControl = proxy['congestion-control'] || proxy['congestion-controller'];
+        if (congestionControl) extras.push(`congestion-controller=${congestionControl}`);
         if (proxy['udp-relay-mode']) extras.push(`udp-relay=${proxy['udp-relay-mode']}`);
         if (proxy.alpn) {
             const alpn = Array.isArray(proxy.alpn) ? proxy.alpn.join(',') : proxy.alpn;
@@ -118,20 +118,21 @@ function buildPolicyLine(group) {
     const members = (['url-test', 'fallback', 'load-balance'].includes(type)
         ? rawMembers.filter(member => !['DIRECT', 'REJECT', 'REJECT-DROP', 'PASS'].includes(String(member).toUpperCase()))
         : rawMembers).join(', ');
-    const filter = Array.isArray(group.filters) && group.filters.length > 0 ? group.filters.join('|') : '';
-    const tolerance = group.options?.tolerance;
-    if (type === 'url-test') {
-        const base = filter ? `${group.name} = url-test, ${members}, url=${group.options?.url || 'http://www.gstatic.com/generate_204'}, interval=${group.options?.interval || 300}, filter=${filter}` : `${group.name} = url-test, ${members}, url=${group.options?.url || 'http://www.gstatic.com/generate_204'}, interval=${group.options?.interval || 300}`;
-        return tolerance ? `${base}, tolerance=${tolerance}` : base;
+    const tolerance = group.options?.tolerance || 50;
+    const interval = group.options?.interval || 300;
+    
+    if (type === 'url-test' || type === 'url-latency-benchmark') {
+        return `url-latency-benchmark=${group.name}, ${members}, check-interval=${interval}, tolerance=${tolerance}`;
     }
-    if (type === 'fallback') {
-        const base = filter ? `${group.name} = fallback, ${members}, url=${group.options?.url || 'http://www.gstatic.com/generate_204'}, interval=${group.options?.interval || 300}, filter=${filter}` : `${group.name} = fallback, ${members}, url=${group.options?.url || 'http://www.gstatic.com/generate_204'}, interval=${group.options?.interval || 300}`;
-        return tolerance ? `${base}, tolerance=${tolerance}` : base;
+    if (type === 'fallback' || type === 'available') {
+        return `available=${group.name}, ${members}`;
     }
     if (type === 'load-balance') {
-        return filter ? `${group.name} = load-balance, ${members}, url=${group.options?.url || 'http://www.gstatic.com/generate_204'}, interval=${group.options?.interval || 300}, filter=${filter}` : `${group.name} = load-balance, ${members}`;
+        // Quantumult X round-robin/load-balance isn't natively identical, but 'available' or 'static' is usually the fallback.
+        // Or we can just fallback to static
+        return `static=${group.name}, ${members}`;
     }
-    return `${group.name} = select, ${members}`;
+    return `static=${group.name}, ${members}`;
 }
 
 function buildRuleLine(rule) {
@@ -166,6 +167,17 @@ export function renderQuanxFromTemplateModel(model, options = {}) {
     const localRules = normalizedModel.rules.filter(r => !remoteRules.includes(r));
 
     return [
+        '[general]',
+        '; 监听端口',
+        'network_check_url=http://www.gstatic.com/generate_204',
+        'server_check_url=http://www.gstatic.com/generate_204',
+        '',
+        '[dns]',
+        '; 优先解析 IPv4',
+        'prefer-ipv4=true',
+        'server=223.5.5.5',
+        'server=114.114.114.114',
+        '',
         '[server_local]',
         ...proxies.map(buildProxyLine).filter(Boolean),
         '',

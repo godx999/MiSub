@@ -21,7 +21,7 @@
 import { handleMisubRequest } from './modules/subscription-handler.js';
 import { handleApiRequest } from './modules/api-router.js';
 import { createJsonResponse, migrateConfigSettings } from './modules/utils.js';
-import { corsMiddleware, securityHeadersMiddleware } from './middleware/cors.js';
+import { corsMiddleware, csrfOriginMiddleware, securityHeadersMiddleware } from './middleware/cors.js';
 import { handleDisguiseRequest } from './modules/handlers/disguise-handler.js';
 import { createDisguiseResponse } from './modules/disguise-page.js';
 
@@ -335,7 +335,15 @@ export async function onRequest(context) {
             origins: parseCorsOrigins(env, url),
             allowCredentials: true
         };
-        return await corsMiddleware(request, () => securityHeadersMiddleware(request, handleRequest), corsOptions);
+        return await corsMiddleware(
+            request,
+            () => csrfOriginMiddleware(
+                request,
+                () => securityHeadersMiddleware(request, handleRequest),
+                corsOptions
+            ),
+            corsOptions
+        );
     } catch (error) {
         // 全局错误处理
         console.error('[Main Handler Error]', error);
